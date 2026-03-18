@@ -207,6 +207,7 @@ class DiffusionServerArgs:
     enable_cache_dit: bool = False
     text_encoder_cpu_offload: bool = False
     enable_warmup: bool = True
+    pipeline_class_name: str | None = None
 
     extras: list[str] = field(default_factory=lambda: [])
     env_vars: dict[str, str] = field(default_factory=dict)
@@ -1059,6 +1060,16 @@ TWO_GPU_CASES_B = [
             model_path="Lightricks/LTX-2.3",
         ),
         TI2V_sampling_params,
+    ),
+    # FLUX.2-klein-9b-kv with KV cache pipeline for reference image conditioning
+    DiffusionTestCase(
+        "flux_2_klein_9b_kv_ti2i",
+        DiffusionServerArgs(
+            model_path="black-forest-labs/FLUX.2-klein-9b-kv",
+            modality="image",
+            pipeline_class_name="Flux2KleinKVCachePipeline",
+        ),
+        TI2I_sampling_params,
     ),
 ]
 
