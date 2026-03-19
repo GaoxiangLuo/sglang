@@ -1067,7 +1067,7 @@ TWO_GPU_CASES_B = [
         DiffusionServerArgs(
             model_path="black-forest-labs/FLUX.2-klein-9b-kv",
             modality="image",
-            pipeline_class_name="Flux2KleinKVCachePipeline",
+            extras=["--pipeline-class-name", "Flux2KleinKVCachePipeline"],
         ),
         TI2I_sampling_params,
     ),
