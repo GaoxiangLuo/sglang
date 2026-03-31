@@ -1,13 +1,32 @@
 # SPDX-License-Identifier: Apache-2.0
 """
-KV cache denoising stage for FLUX.2 Klein.
+KV cache denoising stage for FLUX.2-klein-9b-kv.
 
 On step 0, reference image tokens are included in the forward pass and their
-post-RoPE K/V projections are cached.  On steps 1+, the cached K/V is reused
-so the reference tokens need not be recomputed, saving significant compute.
+post-RoPE K/V projections are cached per attention layer.  On steps 1+, the
+cached K/V is reused so the reference tokens need not be recomputed.
 
-Adapts the standard DenoisingStage by overriding per-step methods rather than
-duplicating the denoising loop.
+Adapts the standard ``DenoisingStage`` by overriding per-step methods rather
+than duplicating the denoising loop.
+
+KV cache modes (``kv_cache_mode`` parameter on the transformer forward):
+
+    ``"extract"``
+        Step 0 only.  Reference tokens are present in the input sequence.
+        Each attention layer stores the post-RoPE K/V for the last
+        ``num_ref_tokens`` positions.  Causal attention is used so that
+        reference tokens only self-attend (preventing noise leakage into
+        the cached representations).  Modulation parameters for reference
+        positions use a fixed timestep (t=0) via blending.
+
+    ``"cached"``
+        Steps 1+.  Reference tokens are *not* in the input sequence.
+        Each attention layer appends the previously cached K/V to the
+        current K/V so that noise/text tokens can still attend to the
+        reference information.
+
+    ``None``
+        Standard forward without KV caching (no reference images).
 """
 
 from typing import Any
@@ -27,22 +46,17 @@ class Flux2KleinKVCacheDenoisingStage(DenoisingStage):
     """Denoising stage that caches reference image K/V on step 0.
 
     Reuses the parent ``DenoisingStage`` loop by overriding:
-    - ``_prepare_denoising_loop``: sets up KV cache and computes freqs_cis
-      without ref positions for steps 1+.
-    - ``_predict_noise_with_cfg``: injects per-step KV cache params and
-      switches from extract to cached mode after step 0.
-    - ``_post_denoising_loop``: clears the KV cache.
 
-    When there are no reference images, all overrides are no-ops and the
-    parent behaviour is used unchanged.
+    - ``_prepare_denoising_loop``: creates KV cache, computes freqs_cis
+      without ref positions for steps 1+, stores both on ``batch``.
+    - ``_predict_noise_with_cfg``: injects per-step KV cache params into
+      ``pos_cond_kwargs`` (and ``neg_cond_kwargs`` when CFG is enabled),
+      clears ``batch.image_latent`` after step 0 to prevent re-concat.
+    - ``_post_denoising_loop``: restores ``batch.image_latent``, clears cache.
+
+    All intermediate state is stored on ``batch`` (not ``self``) so that
+    aborted requests do not leak stale state.
     """
-
-    def __init__(self, *args, **kwargs):
-        super().__init__(*args, **kwargs)
-        self._kv_cache: Flux2KVCache | None = None
-        self._num_ref_tokens: int = 0
-        self._freqs_cis_without_ref: tuple[torch.Tensor, torch.Tensor] | None = None
-        self._saved_image_latent: torch.Tensor | None = None
 
     def _prepare_denoising_loop(self, batch: Req, server_args: ServerArgs):
         prepared = super()._prepare_denoising_loop(batch, server_args)
@@ -50,18 +64,17 @@ class Flux2KleinKVCacheDenoisingStage(DenoisingStage):
         if batch.image_latent is not None:
             num_double = len(self.transformer.transformer_blocks)
             num_single = len(self.transformer.single_transformer_blocks)
-            self._kv_cache = Flux2KVCache(num_double, num_single)
-            self._num_ref_tokens = batch.image_latent.shape[1]
+            batch._kv_cache = Flux2KVCache(num_double, num_single)
+            batch._kv_num_ref_tokens = batch.image_latent.shape[1]
 
-            # Compute freqs_cis without ref by slicing off the last num_ref positions.
-            # freqs_cis layout: [txt_positions, img_positions, ref_positions]
+            # freqs_cis layout: [txt, img, ref] — slice off ref for steps 1+
             cos, sin = prepared["pos_cond_kwargs"]["freqs_cis"]
-            self._freqs_cis_without_ref = (
-                cos[: -self._num_ref_tokens],
-                sin[: -self._num_ref_tokens],
+            batch._kv_freqs_cis_without_ref = (
+                cos[: -batch._kv_num_ref_tokens],
+                sin[: -batch._kv_num_ref_tokens],
             )
         else:
-            self._kv_cache = None
+            batch._kv_cache = None
 
         return prepared
 
@@ -82,22 +95,27 @@ class Flux2KleinKVCacheDenoisingStage(DenoisingStage):
         guidance,
         latents,
     ):
-        if self._kv_cache is not None:
-            # Build step-specific kwargs (don't mutate the original dict)
-            pos_cond_kwargs = dict(pos_cond_kwargs)
-            pos_cond_kwargs["kv_cache"] = self._kv_cache
+        kv_cache = getattr(batch, "_kv_cache", None)
 
+        if kv_cache is not None:
             if timestep_index == 0:
-                # Step 0: extract mode (ref tokens are in latent_model_input
-                # via the parent's image_latent concat)
-                pos_cond_kwargs["kv_cache_mode"] = "extract"
-                pos_cond_kwargs["num_ref_tokens"] = self._num_ref_tokens
-                pos_cond_kwargs["ref_fixed_timestep"] = 0.0
+                kv_params = {
+                    "kv_cache": kv_cache,
+                    "kv_cache_mode": "extract",
+                    "num_ref_tokens": batch._kv_num_ref_tokens,
+                    "ref_fixed_timestep": 0.0,
+                }
             else:
-                # Steps 1+: cached mode, no ref tokens in input
-                pos_cond_kwargs["kv_cache_mode"] = "cached"
-                pos_cond_kwargs["num_ref_tokens"] = 0
-                pos_cond_kwargs["freqs_cis"] = self._freqs_cis_without_ref
+                kv_params = {
+                    "kv_cache": kv_cache,
+                    "kv_cache_mode": "cached",
+                    "num_ref_tokens": 0,
+                    "freqs_cis": batch._kv_freqs_cis_without_ref,
+                }
+
+            pos_cond_kwargs = {**pos_cond_kwargs, **kv_params}
+            if neg_cond_kwargs:
+                neg_cond_kwargs = {**neg_cond_kwargs, **kv_params}
 
         result = super()._predict_noise_with_cfg(
             current_model=current_model,
@@ -118,8 +136,8 @@ class Flux2KleinKVCacheDenoisingStage(DenoisingStage):
 
         # After step 0: clear image_latent so the parent loop won't concat
         # ref tokens on subsequent steps
-        if self._kv_cache is not None and timestep_index == 0:
-            self._saved_image_latent = batch.image_latent
+        if kv_cache is not None and timestep_index == 0:
+            batch._kv_saved_image_latent = batch.image_latent
             batch.image_latent = None
 
         return result
@@ -134,12 +152,16 @@ class Flux2KleinKVCacheDenoisingStage(DenoisingStage):
         is_warmup=False,
     ):
         # Restore image_latent and clean up KV cache
-        if self._saved_image_latent is not None:
-            batch.image_latent = self._saved_image_latent
-            self._saved_image_latent = None
-        if self._kv_cache is not None:
-            self._kv_cache.clear()
-            self._kv_cache = None
+        if hasattr(batch, "_kv_saved_image_latent"):
+            batch.image_latent = batch._kv_saved_image_latent
+            del batch._kv_saved_image_latent
+        if hasattr(batch, "_kv_cache") and batch._kv_cache is not None:
+            batch._kv_cache.clear()
+            del batch._kv_cache
+        if hasattr(batch, "_kv_num_ref_tokens"):
+            del batch._kv_num_ref_tokens
+        if hasattr(batch, "_kv_freqs_cis_without_ref"):
+            del batch._kv_freqs_cis_without_ref
 
         return super()._post_denoising_loop(
             batch,

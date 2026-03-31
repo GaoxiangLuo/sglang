@@ -1181,6 +1181,22 @@ class Flux2Transformer2DModel(CachableDiT, OffloadableDiTMixin):
                 A kwargs dictionary that if specified is passed along to the `AttentionProcessor` as defined under
                 `self.processor` in
                 [diffusers.models.attention_processor](https://github.com/huggingface/diffusers/blob/main/src/diffusers/models/attention_processor.py).
+            kv_cache (`Flux2KVCache`, *optional*):
+                KV cache container for reference image tokens.  Populated in-place during
+                ``"extract"`` mode and read during ``"cached"`` mode.
+            kv_cache_mode (`str`, *optional*):
+                ``"extract"`` — Step 0: reference tokens are in the input.  Each attention
+                layer caches their post-RoPE K/V.  Causal attention is used (ref tokens
+                self-attend only).  Modulation uses a fixed timestep for ref positions.
+                ``"cached"`` — Steps 1+: reference tokens are absent.  Cached K/V is
+                appended to attention K/V so noise/text tokens still attend to ref info.
+                ``None`` — Standard forward without KV caching.
+            num_ref_tokens (`int`):
+                Number of reference image tokens at the end of ``hidden_states``
+                (only used when ``kv_cache_mode="extract"``).
+            ref_fixed_timestep (`float`):
+                Timestep value for reference token modulation blending (default 0.0,
+                only used when ``kv_cache_mode="extract"``).
 
         """
         # 0. Handle input arguments

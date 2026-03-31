@@ -207,7 +207,6 @@ class DiffusionServerArgs:
     enable_cache_dit: bool = False
     text_encoder_cpu_offload: bool = False
     enable_warmup: bool = True
-    pipeline_class_name: str | None = None
 
     extras: list[str] = field(default_factory=lambda: [])
     env_vars: dict[str, str] = field(default_factory=dict)
@@ -1061,7 +1060,7 @@ TWO_GPU_CASES_B = [
         ),
         TI2V_sampling_params,
     ),
-    # FLUX.2-klein-9b-kv with KV cache pipeline for reference image conditioning
+    # FLUX.2-klein-9b-kv with KV cache for reference image conditioning
     DiffusionTestCase(
         "flux_2_klein_9b_kv_ti2i",
         DiffusionServerArgs(
